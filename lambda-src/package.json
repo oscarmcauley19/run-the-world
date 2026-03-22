@@ -1,0 +1,8 @@
+{
+  "name": "rtw-strava-auth-lambda",
+  "version": "0.1.0",
+  "description": "Lambda for Strava OAuth flow",
+  "main": "index.js",
+  "license": "MIT",
+  "dependencies": {}
+}

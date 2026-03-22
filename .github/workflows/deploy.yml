@@ -1,0 +1,106 @@
+name: deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "If true, run terraform plan only and skip secret creation/upload/invalidate"
+        required: false
+        default: "false"
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    name: Deploy infra (safe secret handling)
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Build Strava secret JSON
+        id: build_secret
+        env:
+          STRAVA_CLIENT_ID: ${{ secrets.STRAVA_CLIENT_ID }}
+          STRAVA_CLIENT_SECRET: ${{ secrets.STRAVA_CLIENT_SECRET }}
+          STRAVA_REDIRECT_URI: ${{ secrets.STRAVA_REDIRECT_URI }}
+        run: |
+          if [ -z "$STRAVA_CLIENT_ID" ] || [ -z "$STRAVA_CLIENT_SECRET" ]; then
+            echo "Missing STRAVA_CLIENT_ID or STRAVA_CLIENT_SECRET (set these in Actions Secrets)"
+            exit 1
+          fi
+          printf '{"STRAVA_CLIENT_ID":"%s","STRAVA_CLIENT_SECRET":"%s","STRAVA_REDIRECT_URI":"%s"}' \
+            "$STRAVA_CLIENT_ID" "$STRAVA_CLIENT_SECRET" "$STRAVA_REDIRECT_URI" > secret.json
+          # expose as action output without printing to logs
+          echo "secret_json<<EOF" >> $GITHUB_OUTPUT
+          cat secret.json >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Ensure Secrets Manager secret exists (create or update)
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        env:
+          SECRET_JSON: ${{ steps.build_secret.outputs.secret_json }}
+        run: |
+          set -euo pipefail
+          # Check if secret exists
+          if aws secretsmanager describe-secret --name rtw/strava >/dev/null 2>&1; then
+            echo "Secret exists; creating a new version"
+            aws secretsmanager put-secret-value --secret-id rtw/strava --secret-string "$SECRET_JSON"
+          else
+            echo "Secret not found; creating rtw/strava"
+            aws secretsmanager create-secret --name rtw/strava --secret-string "$SECRET_JSON"
+          fi
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+
+      - name: Terraform init & apply
+        working-directory: terraform
+        env:
+          # we only pass the secret NAME into Terraform, not the secret value
+          TF_VAR_strava_secret_name: rtw/strava
+        run: |
+          terraform init -input=false
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            echo "Dry run requested — running 'terraform plan' only"
+            terraform plan -input=false -out=tfplan
+            terraform show -no-color tfplan > plan.txt || true
+            echo "Saved plan to terraform/plan.txt"
+            exit 0
+          fi
+          terraform apply -auto-approve -input=false
+
+      - name: Upload frontend to S3
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: |
+          set -euo pipefail
+          cd terraform
+          BUCKET=$(terraform output -raw frontend_bucket)
+          if [ -z "$BUCKET" ]; then
+            echo "No frontend bucket output from Terraform"
+            exit 1
+          fi
+          cd ..
+          echo "Syncing frontend/ to s3://$BUCKET"
+          aws s3 sync frontend/ s3://$BUCKET --delete
+
+      - name: Invalidate CloudFront (if present)
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: |
+          set -euo pipefail
+          cd terraform
+          DIST_ID=$(terraform output -raw frontend_cloudfront_distribution_id || true)
+          if [ -n "$DIST_ID" ] && [ "$DIST_ID" != "null" ]; then
+            echo "Creating CloudFront invalidation for distribution $DIST_ID"
+            aws cloudfront create-invalidation --distribution-id $DIST_ID --paths "/*"
+          else
+            echo "No CloudFront distribution id found; skipping invalidation"
+          fi
